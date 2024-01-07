@@ -571,19 +571,71 @@ word gfx_draw_page = 1;
 //////////////////////
 void (*LT_WaitVsync)();
 
-//works smooth in dosbox, PCem, Real VGA.
-//Choppy on SVGA or modern VGA compatibles
+static int MaxHblankLength;
+
+void LT_CalibrateMaxHblankLength()
+{
+	int i;
+	MaxHblankLength = 0;
+	// Benchmark: What is the maximum amount of ISA/PCI/AGP port I/Os that can be
+	// performed within a single hblank period?
+	// I.e. find what is the max length on the bus that a Hblank can take.
+	for(i = 0; i < 1000; ++i)
+	{
+		int length = 0;
+		unsigned char status, seen_status = 0;
+		disable();
+		while(inportb(0x3DA) & 9);
+		while(!(inportb(0x3DA) & 9));
+		do {
+			status = inportb(0x3DA);
+			seen_status |= status;
+			++length;
+		} while((status & 9) == 1);
+		enable();
+		if (!(seen_status & 8) && length > MaxHblankLength)
+			MaxHblankLength = length;
+	}
+	MaxHblankLength += 5; // For good measure, give a few more I/Os extra
+}
+
 void LT_WaitVsync_VGA(){
 	byte _ac;
 	word x = SCR_X;
 	word y = SCR_Y + pageflip[gfx_draw_page&1];
+	int i;
 	
 	//
 	y*=LT_VRAM_Logical_Width;
 	if (LT_VIDEO_MODE == 0) y += x>>3;
 	if (LT_VIDEO_MODE == 1) y += x>>2;
 	gfx_draw_page++;
-	
+
+wait_for_active_picture:
+	while(inportb(0x3DA)&1) /*nop*/; // Wait until we are in visible picture area
+
+wait_for_hblank:
+	disable(); // Enter time critical stage: estimating the length of a blank.
+
+	for(i = MaxHblankLength; i--;)
+	{
+		unsigned char status = inportb(0x3DA);
+		// If we have made it to vsync, we blew it. Restart wait from scratch.
+		if (status & 8) { enable(); goto wait_for_active_picture; }
+		// If we are in visible picture, this was not the start of a blank, or this
+		// was just a hblank. Let interrupts breathe and restart the wait.
+		if (!(status & 1)) { enable(); goto wait_for_hblank; }
+	}
+
+	// If we get here, we have entered a display blank period that is longer than
+	// a hblank interval, so we conclude we must have just now entered a vblank.
+	// (but we aren't yet at start of vsync)
+	// Interrupts are disabled at this point, so we can safely update
+	// Display Start (DS) and Horizontal Shift Count (HS) registers so all
+	// adapters will latch it properly, with all their varying quirky behaviors.
+	// (Pedantically, it is tiny bit better better to write DS register before HS,
+	// because IBM EGA and VGA latch the DS register before the HS register)
+
 	//change scroll registers: 
 	asm mov dx,003d4h //VGA PORT
 	asm mov	cl,8
@@ -596,23 +648,6 @@ void LT_WaitVsync_VGA(){
 	asm	or	ax,00Ch	//HIGH_ADDRESS 0x0C;
 	asm out dx,ax	//(y & 0xFF00) | 0x0C to VGA port
 
-	//The smooth panning magic happens here
-	//disable interrupts
-	asm cli
-	
-	//Wait Vsync
-	asm mov		dx,INPUT_STATUS_0
-	WaitNotVsync:
-	asm in      al,dx
-	asm test    al,08h
-	asm jnz		WaitNotVsync
-	WaitVsync:
-	asm in      al,dx
-	asm test    al,08h
-	asm jz		WaitVsync
-	
-	asm mov		dx,INPUT_STATUS_0 //Read input status, to Reset the VGA flip/flop
-	//_ac = inp(AC_INDEX);//Store the value of the controller
 	if (LT_VIDEO_MODE == 0) pix = p1[SCR_X & 7]; //VGA
 	else pix = p[SCR_X & 3]; //VGA
 	
@@ -623,13 +658,9 @@ void LT_WaitVsync_VGA(){
 	asm mov al,byte ptr pix
 	asm out dx,al
 	
-	//Restore controller value
-	//asm mov ax,word ptr _ac
-	//asm out dx,ax
-	
 	LT_FrameSkip = 0;
 	//enable interrupts
-	asm sti
+	enable();
 }
 
 byte panning = 0;

@@ -33,6 +33,7 @@ int LT_Load_Logo = 0;
 void interrupt (*LT_old_time_handler)(void); 	
 void interrupt (*LT_old_key_handler)(void);
 void LT_vsync();
+void LT_CalibrateMaxHblankLength();
 
 void LT_Fade_in_VGA();
 void LT_Fade_in_EGA();
@@ -186,6 +187,7 @@ void LT_Setup(){
 	byte character = 0;
 	system("cls");
 	Check_Graphics_Card();
+	LT_CalibrateMaxHblankLength();
 	LT_setupfile = fopen("config.txt","rb+");
 	if (!LT_setupfile) {
 		printf("config.txt is missing\nNew default file created");
