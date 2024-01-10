@@ -571,7 +571,40 @@ word gfx_draw_page = 1;
 //////////////////////
 void (*LT_WaitVsync)();
 
-static int MaxHblankLength;
+static unsigned char MaxHblankLength;
+
+static unsigned char benchmark_hblank_length()
+{
+	unsigned char hblank_length;
+	asm cli
+	asm mov dx, 3DAh
+
+wait_blank_end:  // if we are in hblank or vblank, wait for it to end
+	asm in al, dx  // Read 3DAh - Status Register
+	asm test al, 1 // Bit 0: Display Blank
+	asm jnz wait_blank_end
+
+wait_active_end: // wait for the end of the active scanline
+	asm in al, dx  // Read 3DAh again
+	asm test al, 1
+	asm jz wait_active_end
+
+	// We are now right at the start of a blank period, either hblank or vblank
+	// Calculate how many cycles this blank lasts.
+	asm mov cx, 0    // store in cl: seen_status, ch: hblank_len
+calc_blank_length: // measure how many I/O port read cmds we can do in blank
+	asm in al, dx    // Read port.
+	asm or cl, al    // Track in cl if this blank period contained vsync bit
+	asm inc ch       // Accumulate count of I/Os performed
+	asm test al, 1   // Still in blank period?
+	asm jnz calc_blank_length
+
+	asm test cl, 8   // Blank period is now over. Check if it included vsync
+	asm jnz wait_blank_end // If so, restart all from scratch. We wanted hblank.
+  asm mov hblank_length, ch
+  asm sti
+  return hblank_length;
+}
 
 void LT_CalibrateMaxHblankLength()
 {
@@ -582,21 +615,12 @@ void LT_CalibrateMaxHblankLength()
 	// I.e. find what is the max length on the bus that a Hblank can take.
 	for(i = 0; i < 1000; ++i)
 	{
-		int length = 0;
-		unsigned char status, seen_status = 0;
-		disable();
-		while(inportb(0x3DA) & 9);
-		while(!(inportb(0x3DA) & 9));
-		do {
-			status = inportb(0x3DA);
-			seen_status |= status;
-			++length;
-		} while((status & 9) == 1);
-		enable();
-		if (!(seen_status & 8) && length > MaxHblankLength)
-			MaxHblankLength = length;
+		int length = benchmark_hblank_length();
+		if (length > MaxHblankLength) MaxHblankLength = length;
 	}
-	MaxHblankLength += 5; // For good measure, give a few more I/Os extra
+	// Add just a tiny bit more over the count that we got.
+	if (MaxHblankLength <= 253) MaxHblankLength += 2;
+	printf("MaxHblankLength: %d\n", (int)MaxHblankLength);
 }
 
 void LT_WaitVsync_VGA(){
@@ -611,21 +635,39 @@ void LT_WaitVsync_VGA(){
 	if (LT_VIDEO_MODE == 1) y += x>>2;
 	gfx_draw_page++;
 
-wait_for_active_picture:
-	while(inportb(0x3DA)&1) /*nop*/; // Wait until we are in visible picture area
+	asm mov dx, 3DAh
+
+wait_for_active_picture: // Wait until we are in visible picture area.
+	asm in al, dx          // Read 3DAh - Status Register
+	asm test al, 1         // Bit 0: set if we are in Display Blank.
+	asm jnz wait_for_active_picture
+
+	// We are now in visible picture area (so can't be in vsync, or right headed
+	// into it)
 
 wait_for_hblank:
-	disable(); // Enter time critical stage: estimating the length of a blank.
+	asm cli // Enter time critical stage: estimating the length of a blank.
+	asm mov cl, MaxHblankLength // Reset wait counter to default
 
-	for(i = MaxHblankLength; i--;)
-	{
-		unsigned char status = inportb(0x3DA);
-		// If we have made it to vsync, we blew it. Restart wait from scratch.
-		if (status & 8) { enable(); goto wait_for_active_picture; }
-		// If we are in visible picture, this was not the start of a blank, or this
-		// was just a hblank. Let interrupts breathe and restart the wait.
-		if (!(status & 1)) { enable(); goto wait_for_hblank; }
-	}
+loop_hblank_length_times:
+	asm in al, dx    // Read status port
+
+	asm test al, 1   // Are we in display blank?
+	asm jnz in_blank // If 1, then we are in blank
+
+	asm sti // Else 0, and we are still in visible picture area. Let interrupts
+	asm jmp wait_for_hblank // breathe and restart the wait.
+
+in_blank: // We are in blank, but have we slipped over to vsync?
+	asm test al, 8 // Test if in vsync?
+	asm jz in_blank_not_vsync // If 0, we are not in vsync
+
+	asm sti // Else 1, we are in vsync, so we blew it. Restart the wait.
+	asm jmp wait_for_active_picture
+
+in_blank_not_vsync: // We are in blank, either hblank or vblank
+	asm dec cl        // Decrement search counter
+	asm jnz loop_hblank_length_times // And loop back if we still need to.
 
 	// If we get here, we have entered a display blank period that is longer than
 	// a hblank interval, so we conclude we must have just now entered a vblank.
@@ -660,7 +702,7 @@ wait_for_hblank:
 	
 	LT_FrameSkip = 0;
 	//enable interrupts
-	enable();
+	asm sti
 }
 
 byte panning = 0;
