@@ -571,13 +571,36 @@ word gfx_draw_page = 1;
 //////////////////////
 void (*LT_WaitVsync)();
 
-static unsigned char MaxHblankLength;
+void LT_WaitVsync_VGA(){
+	byte _ac;
+	word x = SCR_X;
+	word y = SCR_Y + pageflip[gfx_draw_page&1];
+	int i;
+	
+	//
+	y*=LT_VRAM_Logical_Width;
+	if (LT_VIDEO_MODE == 0) y += x>>3;
+	if (LT_VIDEO_MODE == 1) y += x>>2;
+	gfx_draw_page++;
 
-static unsigned char benchmark_hblank_length()
-{
-	unsigned char hblank_length;
-	asm cli
+	// We want to sync to the start of a vblank (not vsync) below, so that
+	// DS and HS registers can be safely updated. But the problem is that the
+	// EGA/VGA adapters do not provide a mechanism to wait until start of vblank,
+	// i.e. it does not enable distinguishing between hblank and vblank.
+
+	// To overcome this problem, we first measure the length of a hblank, and then
+	// use the measured value to search when we arrive at start of vblank instead.
+
+	// This way the latching behavior of all EGA/VGA/SVGA cards is appeased, and
+	// since the hblank length is re-benchmarked each frame, the following code
+	// also works on emulators like DOSBox when one messes with the cycles
+	// setting in the middle of running the game.
+
 	asm mov dx, 3DAh
+
+restart_wait:
+	asm cli
+	asm mov ch, 0  // store in ch: hblank_len
 
 wait_blank_end:  // if we are in hblank or vblank, wait for it to end
 	asm in al, dx  // Read 3DAh - Status Register
@@ -591,51 +614,22 @@ wait_active_end: // wait for the end of the active scanline
 
 	// We are now right at the start of a blank period, either hblank or vblank
 	// Calculate how many cycles this blank lasts.
-	asm mov cx, 0    // store in cl: seen_status, ch: hblank_len
 calc_blank_length: // measure how many I/O port read cmds we can do in blank
 	asm in al, dx    // Read port.
-	asm or cl, al    // Track in cl if this blank period contained vsync bit
+
+	asm test al, 8 // Test if in vsync?
+	asm jnz restart_wait // We reached vsync, restart benchmark from scratch.
+
 	asm inc ch       // Accumulate count of I/Os performed
 	asm test al, 1   // Still in blank period?
 	asm jnz calc_blank_length
 
-	asm test cl, 8   // Blank period is now over. Check if it included vsync
-	asm jnz wait_blank_end // If so, restart all from scratch. We wanted hblank.
-  asm mov hblank_length, ch
-  asm sti
-  return hblank_length;
-}
+	// We are now in visible picture area with interrupts disabled.
 
-void LT_CalibrateMaxHblankLength()
-{
-	int i;
-	MaxHblankLength = 0;
-	// Benchmark: What is the maximum amount of ISA/PCI/AGP port I/Os that can be
-	// performed within a single hblank period?
-	// I.e. find what is the max length on the bus that a Hblank can take.
-	for(i = 0; i < 1000; ++i)
-	{
-		int length = benchmark_hblank_length();
-		if (length > MaxHblankLength) MaxHblankLength = length;
-	}
-	// Add just a tiny bit more over the count that we got.
-	if (MaxHblankLength <= 253) MaxHblankLength += 2;
-	printf("MaxHblankLength: %d\n", (int)MaxHblankLength);
-}
-
-void LT_WaitVsync_VGA(){
-	byte _ac;
-	word x = SCR_X;
-	word y = SCR_Y + pageflip[gfx_draw_page&1];
-	int i;
-	
-	//
-	y*=LT_VRAM_Logical_Width;
-	if (LT_VIDEO_MODE == 0) y += x>>3;
-	if (LT_VIDEO_MODE == 1) y += x>>2;
-	gfx_draw_page++;
-
-	asm mov dx, 3DAh
+	// Search for a blank length that is longer than (blank+1)*2 the one that we
+	// found. That should be enough to ascertain we are now in vblank.
+	asm inc ch
+	asm shl ch, 1
 
 wait_for_active_picture: // Wait until we are in visible picture area.
 	asm in al, dx          // Read 3DAh - Status Register
@@ -646,24 +640,18 @@ wait_for_active_picture: // Wait until we are in visible picture area.
 	// into it)
 
 wait_for_hblank:
+	asm sti        // Let interrupts breathe
+	asm mov cl, ch // Reset wait counter to default
 	asm cli // Enter time critical stage: estimating the length of a blank.
-	asm mov cl, MaxHblankLength // Reset wait counter to default
 
 loop_hblank_length_times:
 	asm in al, dx    // Read status port
 
 	asm test al, 1   // Are we in display blank?
-	asm jnz in_blank // If 1, then we are in blank
+	asm jz wait_for_hblank // If 0, we are still in visible picture area. Restart.
 
-	asm sti // Else 0, and we are still in visible picture area. Let interrupts
-	asm jmp wait_for_hblank // breathe and restart the wait.
-
-in_blank: // We are in blank, but have we slipped over to vsync?
-	asm test al, 8 // Test if in vsync?
-	asm jz in_blank_not_vsync // If 0, we are not in vsync
-
-	asm sti // Else 1, we are in vsync, so we blew it. Restart the wait.
-	asm jmp wait_for_active_picture
+	asm test al, 8 // We are in blank, but have we slipped over to vsync?
+	asm jnz restart_wait // If 1, we are in vsync so blew it, restart the wait.
 
 in_blank_not_vsync: // We are in blank, either hblank or vblank
 	asm dec cl        // Decrement search counter
